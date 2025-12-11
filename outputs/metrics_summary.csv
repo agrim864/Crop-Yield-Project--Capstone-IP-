@@ -1,8 +1,8 @@
 model,baseline_clf_macro_f1,baseline_reg_rmse,baseline_reg_r2,setting,macro_f1,rmse_mean,r2_mean,rmse,r2
 Baseline,0.16666666666666666,0.7381495484750084,0.0,,,,,,
-Aerosol-only,,,,tscv,0.3411557810750243,,,,
-Meteorology-only,,,,tscv,0.24046012347794674,,,,
-Combined_RF,,,,tscv,0.3609178804190333,,,,
-Ridge,,,,tscv,,1.1247714191482818,-2.7452057853206835,,
-GradientBoosting,,,,tscv,,0.5748049546177559,0.33602715852418164,,
-GB_backtest,,,,backtest,,,,0.4155739852121881,0.7996056706814054
+Aerosol-only,,,,tscv,0.38023706473727786,,,,
+Meteorology-only,,,,tscv,0.26839080630818535,,,,
+Combined_RF,,,,tscv,0.41906388438009834,,,,
+Ridge,,,,tscv,,1.2839267815651347,-5.3766275804464945,,
+GradientBoosting,,,,tscv,,0.578330203126792,0.31767295878100366,,
+GB_backtest,,,,backtest,,,,0.41608600262202694,0.7991115656712242
