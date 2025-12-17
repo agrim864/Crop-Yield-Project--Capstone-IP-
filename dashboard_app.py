@@ -138,7 +138,7 @@ def make_scenario_chart(scenarios: pd.DataFrame, region: str, crop: str, scenari
         )
         .properties(width=700, height=350)
     )
-    st.altair_chart(chart, width="stretch")
+    st.altair_chart(chart)  # remove width kwarg if your Streamlit is old
 
 
 def make_backtest_chart(backtest: pd.DataFrame, region: str, crop: str):
@@ -174,7 +174,7 @@ def make_backtest_chart(backtest: pd.DataFrame, region: str, crop: str):
         )
         .properties(width=700, height=350)
     )
-    st.altair_chart(chart, width="stretch")
+    st.altair_chart(chart)  # remove width kwarg if needed
 
 
 def make_importance_chart(gb_importance: pd.DataFrame, top_k: int = 10):
@@ -196,7 +196,7 @@ def make_importance_chart(gb_importance: pd.DataFrame, top_k: int = 10):
     )
 
     st.subheader("Global feature importance (GB regressor)")
-    st.altair_chart(chart, width="stretch")
+    st.altair_chart(chart)
     st.caption(
         "Permutation importance of the Gradient Boosting yield model. "
         "Higher values = larger average drop in R² when that feature is shuffled."
@@ -252,8 +252,21 @@ This dashboard reads the outputs from your Python pipeline:
             """
         )
 
-        st.markdown("Sample of cleaned panel dataset:")
-        st.dataframe(panel.head(20))
+        st.markdown("Sample of cleaned panel dataset (filtered by Region & Crop):")
+
+        # NEW: filter by selected_region + selected_crop
+        filtered_panel = panel[
+            (panel["region"] == selected_region)
+            & (panel["crop"] == selected_crop)
+        ]
+
+        if filtered_panel.empty:
+            st.warning(
+                "No rows for this Region/Crop combination. Showing global sample instead."
+            )
+            st.dataframe(panel.head(20))
+        else:
+            st.dataframe(filtered_panel.head(20))
 
     # -------------------------
     # Model comparison
@@ -265,10 +278,10 @@ This dashboard reads the outputs from your Python pipeline:
         rmse_df = build_rmse_df(metrics)
 
         st.markdown("Macro-F1 scores (yield class prediction):")
-        st.altair_chart(make_f1_chart(f1_df), width="stretch")
+        st.altair_chart(make_f1_chart(f1_df))
 
         st.markdown("RMSE for continuous yield prediction:")
-        st.altair_chart(make_rmse_chart(rmse_df), width="stretch")
+        st.altair_chart(make_rmse_chart(rmse_df))
 
         st.markdown(
             """
