@@ -1,8 +1,5 @@
-model,baseline_clf_macro_f1,baseline_reg_rmse,baseline_reg_r2,setting,macro_f1,rmse_mean,r2_mean,rmse,r2
-Baseline,0.16666666666666666,0.7381495484750084,0.0,,,,,,
-Aerosol-only,,,,tscv,0.3411557810750243,,,,
-Meteorology-only,,,,tscv,0.24046012347794674,,,,
-Combined_RF,,,,tscv,0.3609178804190333,,,,
-Ridge,,,,tscv,,1.1247714191482818,-2.7452057853206835,,
-GradientBoosting,,,,tscv,,0.5748049546177559,0.33602715852418164,,
-GB_backtest,,,,backtest,,,,0.4155739852121881,0.7996056706814054
+model,baseline_clf_macro_f1,baseline_reg_rmse,baseline_reg_r2,best_model_name,cv_f1_macro,train_f1_macro,train_accuracy,oof_f1_macro,oof_accuracy,oof_n,cv_r2,train_rmse,train_r2,oof_rmse,oof_r2,rmse,r2,mae,mape,n
+Baseline,0.16666666666666666,0.7381495484750084,0.0,,,,,,,,,,,,,,,,,
+BestClassifier,,,,Reg2Tertile(HistGB),0.5685307017543859,0.6937306537306537,0.6865079365079365,0.594384707287933,0.7083333333333334,48.0,,,,,,,,,,
+BestRegressor,,,,SVR_RBF,,,,,,48.0,0.7355418777378696,0.2714046787452761,0.8648095718335065,0.4635875848427831,0.7346572429237611,,,,,
+Backtest,,,,,,,,,,,,,,,,0.41309320810798394,0.801991045401745,0.31515558958557893,17.57841981789071,36.0

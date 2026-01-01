@@ -1,0 +1,49 @@
+Crop Yield, Aerosols & Forecasting – Summary
+
+Dataset:
+- Rows: 252
+- Regions: 4
+- Crops: 3
+- Years: 2000 → 2020
+
+Baselines:
+- Classifier macro-F1: 0.167
+- Regressor RMSE: 0.738
+- Regressor R²: 0.000
+
+BestClassifier:
+- Model: Reg2Tertile(HistGB)
+- OOF macro-F1: 0.594
+- OOF accuracy: 0.708
+- Train macro-F1: 0.694
+
+BestRegressor:
+- Model: SVR_RBF
+- OOF RMSE: 0.464
+- OOF R²: 0.735
+
+Backtest (walk-forward, leak-free):
+- RMSE: 0.413
+- MAE: 0.315
+- MAPE (%): 17.578
+- R²: 0.802
+- Rows: 36.0
+
+Time-based backtest metrics by year (last few years):
+ year     rmse      mae      mape       r2  n
+ 2018 0.592773 0.478979 30.838128 0.669645 12
+ 2019 0.331788 0.287400 12.166016 0.874924 12
+ 2020 0.224666 0.179088  9.731116 0.920883 12
+
+Outputs written:
+- outputs\panel_dataset_cleaned.csv
+- outputs\metrics_summary.csv
+- outputs\backtest_forecasts.csv
+- outputs\backtest_metrics_by_year.csv
+- outputs\yield_forecast_10_years.csv
+- outputs\yield_forecast_scenarios.csv
+- outputs\yield_forecast_past_only.csv
+- outputs\yield_forecast_scenarios_past_only.csv
+- outputs\permutation_importance.csv
+- outputs\gb_feature_importance.csv
+- outputs\timing_summary.csv

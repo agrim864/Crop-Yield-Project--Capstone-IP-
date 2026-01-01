@@ -1,0 +1,101 @@
+{
+  "task": "classification",
+  "approach": "regression_to_tertiles",
+  "best_model": "Reg2Tertile(HistGB)",
+  "best_score_cv_mean_f1_macro": 0.5685307017543859,
+  "best_params": {
+    "reg_pipeline__model__min_samples_leaf": 10,
+    "reg_pipeline__model__max_leaf_nodes": 15,
+    "reg_pipeline__model__max_depth": 2,
+    "reg_pipeline__model__learning_rate": 0.05,
+    "reg_pipeline__model__l2_regularization": 0.1
+  },
+  "numeric_features_used": [
+    "90%tile precipitation (mm/day)",
+    "aod",
+    "pm2.5 ugm-3",
+    "yield_lag1",
+    "yield_lag2",
+    "year",
+    "yield_lag_last",
+    "yield_lag_count_nonnull",
+    "yield_lag_mean_2",
+    "yield_lag_mean_3",
+    "yield_lag_mean_5",
+    "yield_lag_std_3",
+    "yield_lag_std_5",
+    "yield_lag_min_3",
+    "yield_lag_max_3",
+    "yield_lag_min_5",
+    "yield_lag_max_5",
+    "yield_lag_slope_3",
+    "yield_lag_slope_5",
+    "yield_lag_momentum_1",
+    "yield_lag_momentum_2",
+    "yield_lag_momentum_4",
+    "yield_lag_ratio_last_mean3",
+    "te_crop",
+    "te_region",
+    "te_region_crop",
+    "lag_last_minus_te_crop",
+    "lag_last_minus_te_region",
+    "lag_last_minus_te_region_crop",
+    "lag_last_div_te_crop",
+    "lag_last_div_te_region_crop"
+  ],
+  "best_score": 0.594384707287933,
+  "train_accuracy": 0.6865079365079365,
+  "train_precision_macro": 0.7238785121328224,
+  "train_recall_macro": 0.6865079365079364,
+  "train_f1_macro": 0.6937306537306537,
+  "oof_f1_macro": 0.594384707287933,
+  "oof_accuracy": 0.7083333333333334,
+  "oof_n": 48,
+  "best_score_type": "oof_f1_macro",
+  "model_failures": [],
+  "feature_set_info": {
+    "feature_set_mode": "auto",
+    "missing_threshold": 0.25,
+    "feature_set_cv_score": 0.38208127155495575,
+    "n_numeric_selected": 6,
+    "all_candidates": [
+      {
+        "thr": 0.25,
+        "score": 0.38208127155495575,
+        "n_numeric": 6
+      },
+      {
+        "thr": 0.5,
+        "score": 0.36887464387464386,
+        "n_numeric": 12
+      },
+      {
+        "thr": 0.6,
+        "score": 0.36887464387464386,
+        "n_numeric": 13
+      },
+      {
+        "thr": 0.7,
+        "score": 0.36887464387464386,
+        "n_numeric": 16
+      },
+      {
+        "thr": 0.35,
+        "score": 0.3642450142450142,
+        "n_numeric": 9
+      },
+      {
+        "thr": 0.85,
+        "score": 0.3642450142450142,
+        "n_numeric": 35
+      }
+    ]
+  },
+  "tertiles_mode": "fixed",
+  "use_target_mean": true,
+  "target_mean_smoothing": 10.0,
+  "data_signature": "15a07629a2207f49fdc837601681b278",
+  "code_version": "2026-01-02_combined_clean_v1",
+  "tune_mode": "full",
+  "feature_set": "auto"
+}

@@ -1,0 +1,107 @@
+{
+  "task": "regression",
+  "best_model": "SVR_RBF",
+  "best_score_cv_mean_r2": 0.7355418777378696,
+  "best_params": {
+    "model__gamma": "auto",
+    "model__epsilon": 0.03,
+    "model__C": 10.0
+  },
+  "n_samples": 252,
+  "n_features_numeric_used": 38,
+  "numeric_features_used": [
+    "90%tile precipitation (mm/day)",
+    "aod",
+    "ch4 avg (ppbv)",
+    "ch4 day (ppbv)",
+    "ch4 night (ppbv)",
+    "co sfc conc (ppbv)",
+    "pm2.5 ugm-3",
+    "surface skin temp avg",
+    "surface skin temp day",
+    "surface skin temp night",
+    "yield_lag1",
+    "yield_lag2",
+    "year",
+    "yield_lag_last",
+    "yield_lag_count_nonnull",
+    "yield_lag_mean_2",
+    "yield_lag_mean_3",
+    "yield_lag_mean_5",
+    "yield_lag_std_3",
+    "yield_lag_std_5",
+    "yield_lag_min_3",
+    "yield_lag_max_3",
+    "yield_lag_min_5",
+    "yield_lag_max_5",
+    "yield_lag_slope_3",
+    "yield_lag_slope_5",
+    "yield_lag_momentum_1",
+    "yield_lag_momentum_2",
+    "yield_lag_momentum_4",
+    "yield_lag_ratio_last_mean3",
+    "te_crop",
+    "te_region",
+    "te_region_crop",
+    "lag_last_minus_te_crop",
+    "lag_last_minus_te_region",
+    "lag_last_minus_te_region_crop",
+    "lag_last_div_te_crop",
+    "lag_last_div_te_region_crop"
+  ],
+  "dropped_numeric_allnan_or_constant": [],
+  "outer_n_jobs": 4,
+  "cv_n_splits": 4,
+  "model_failures": [],
+  "feature_set_info": {
+    "feature_set_mode": "auto",
+    "missing_threshold": 0.6,
+    "feature_set_cv_score": 0.55132756458805,
+    "n_numeric_selected": 13,
+    "all_candidates": [
+      {
+        "thr": 0.6,
+        "score": 0.55132756458805,
+        "n_numeric": 13
+      },
+      {
+        "thr": 0.5,
+        "score": 0.5464974446997933,
+        "n_numeric": 12
+      },
+      {
+        "thr": 0.7,
+        "score": 0.5392333666649918,
+        "n_numeric": 16
+      },
+      {
+        "thr": 0.35,
+        "score": 0.5382319972785049,
+        "n_numeric": 9
+      },
+      {
+        "thr": 0.85,
+        "score": 0.528947129301835,
+        "n_numeric": 35
+      },
+      {
+        "thr": 0.25,
+        "score": 0.5124754443341992,
+        "n_numeric": 6
+      }
+    ]
+  },
+  "best_score": 0.7346572429237611,
+  "train_rmse": 0.2714046787452761,
+  "train_r2": 0.8648095718335065,
+  "oof_r2": 0.7346572429237611,
+  "oof_rmse": 0.4635875848427831,
+  "oof_n": 48,
+  "best_score_type": "oof_r2",
+  "use_target_mean": true,
+  "target_mean_smoothing": 10.0,
+  "data_signature": "d1fa20ba77a77fc4928b08cf2908c51f",
+  "code_version": "2026-01-02_combined_clean_v1",
+  "tune_mode": "full",
+  "feature_set": "auto"
+}

@@ -1,0 +1,17 @@
+data_path: "compiled data FINAL (3).xlsx"
+outputs_dir: "outputs"
+
+random_state: 42
+
+cv:
+  n_splits: 4
+  min_samples_cv: 8
+
+forecast:
+  years_ahead: 10
+
+scenario:
+  clean_scale: 0.8
+  polluted_scale: 1.2
+  aod_cols: ["AOD", "Aod"]
+  pm_cols: ["PM2.5 (μgm-3)", "pm2.5", "pm2.5 μgm-3"]
