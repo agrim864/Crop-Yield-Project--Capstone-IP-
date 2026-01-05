@@ -440,7 +440,14 @@ def _regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, Any
 
     mask = np.isfinite(yt) & np.isfinite(yp)
     if int(mask.sum()) == 0:
-        return {"rmse": np.nan, "mae": np.nan, "mape": np.nan, "r2": np.nan, "n": 0}
+        return {
+            "rmse": np.nan,
+            "mae": np.nan,
+            "mape": np.nan,
+            "r2": np.nan,
+            "accuracy_within_10pct": np.nan,
+            "n": 0,
+        }
 
     yt = yt[mask]
     yp = yp[mask]
@@ -455,10 +462,25 @@ def _regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, Any
     else:
         mape = np.nan
 
+    # How often is our prediction within 10% of the actual value?
+    if bool(m_mask.any()):
+        diff_pct = np.abs((yt[m_mask] - yp[m_mask]) / yt[m_mask])
+        accuracy_within_10pct = float(np.mean(diff_pct <= 0.10) * 100.0)
+    else:
+        accuracy_within_10pct = np.nan
+
     # r2_score needs at least two unique true values
     r2 = float(r2_score(yt, yp)) if len(np.unique(yt)) > 1 else np.nan
 
-    return {"rmse": rmse, "mae": mae, "mape": mape, "r2": r2, "n": int(len(yt))}
+    return {
+        "rmse": rmse,
+        "mae": mae,
+        "mape": mape,
+        "r2": r2,
+        "accuracy_within_10pct": accuracy_within_10pct,
+        "n": int(len(yt)),
+    }
+
 
 
 def compute_backtest_metrics_overall(
@@ -481,7 +503,8 @@ def compute_backtest_metrics_by_year(
     true_col: str = "yield_true",
     pred_col: str = "yield_pred",
 ) -> pd.DataFrame:
-    cols = ["year", "rmse", "mae", "mape", "r2", "n"]
+    cols = ["year", "rmse", "mae", "mape", "accuracy_within_10pct", "r2", "n"]
+
     if backtest_df is None or backtest_df.empty or year_col not in backtest_df.columns:
         return pd.DataFrame(columns=cols)
 

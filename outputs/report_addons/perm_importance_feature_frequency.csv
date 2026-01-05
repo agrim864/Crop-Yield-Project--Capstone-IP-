@@ -1,0 +1,22 @@
+feature,folds_in_topk
+num__missingindicator_90%tile precipitation,4
+num__radiation,4
+num__surface skin temp,4
+num__yield_lag1,4
+num__aod,3
+num__co sfc conc (ppbv),3
+num__surface skin temp day,3
+num__surface skin temp night,3
+num__surface skin temp years,3
+num__90%tile precipitation (mm/day),2
+num__ch4 avg (ppbv),2
+num__ch4 day (ppbv),2
+num__missingindicator_yield_lag2,2
+num__total column ozone dobson,2
+num__ch4,1
+num__ch4 night (ppbv),1
+num__ozone 1 deg.,1
+num__shortwave radiation,1
+num__so2 conc (ugm-3),1
+num__total column o3 du,1
+num__yield_lag2,1

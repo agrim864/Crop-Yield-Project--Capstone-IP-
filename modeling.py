@@ -1,17 +1,5 @@
 # modeling.py  (combined + cleaned)
 
-# - Keeps only: baselines, tuned classifier/regressor (with caching), lag features, target-mean features,
-#   OOF (leak-free) metrics, and permutation importance.
-# - Removes older “utility” trainers (Ridge/GB/RF/LogReg baselines) because tuning covers them.
-# - Includes fixes: NaN-safe preprocessing, no KeyError from te_* in direct classifiers,
-#   OOF metrics used as the reported best_score, and quieter warnings.
-# - Adds neural networks: MLPClassifier and MLPRegressor candidates (scikit-learn).
-#
-# ✅ Update (2026-01-02):
-# - Made feature-col selection robust to missing columns in the Excel/panel:
-#   uses reindex(...) so missing feature columns become NaN instead of raising KeyError.
-#   This touches: _build_X, _clean_mask_for_task, _data_signature, compute_permutation_importance.
-
 from __future__ import annotations
 
 import json
@@ -29,12 +17,12 @@ import joblib
 
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin, TransformerMixin, clone
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, RobustScaler
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import RandomizedSearchCV, cross_val_score
 from sklearn.inspection import permutation_importance
-from sklearn.utils.class_weight import compute_sample_weight
+from sklearn.utils.class_weight import compute_sample_weight, compute_class_weight
 
 from sklearn.metrics import (
     f1_score, accuracy_score, precision_score, recall_score,
@@ -43,17 +31,31 @@ from sklearn.metrics import (
 
 from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor
 from sklearn.ensemble import HistGradientBoostingRegressor, HistGradientBoostingClassifier
+from sklearn.ensemble import VotingRegressor, StackingRegressor, VotingClassifier
+
+from sklearn.linear_model import RidgeCV, HuberRegressor, LogisticRegression
 from sklearn.svm import SVR, LinearSVC
+from sklearn.ensemble import RandomForestClassifier, BaggingClassifier
+from sklearn.tree import DecisionTreeClassifier
 
 # ✅ Neural nets (sklearn)
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.exceptions import ConvergenceWarning
 
 from threadpoolctl import threadpool_limits
+import inspect
 
 from year_split import YearForwardSplit
 from config import CONFIG
 
+try:
+    from imblearn.over_sampling import SMOTE
+    from imblearn.ensemble import BalancedBaggingClassifier
+    _IMBLEARN_AVAILABLE = True
+except Exception:
+    SMOTE = None
+    BalancedBaggingClassifier = None
+    _IMBLEARN_AVAILABLE = False
 
 # --------------------------
 # Version + env knobs
@@ -70,7 +72,7 @@ FORCE_RETRAIN = os.environ.get("CROP_FORCE_RETRAIN", "0").strip() == "1"
 
 # Optional: manually force which feature set to use (normally keep "auto")
 # auto/core/mid/full
-FEATURE_SET = os.environ.get("CROP_FEATURE_SET", "auto").strip().lower()
+FEATURE_SET = os.environ.get("CROP_FEATURE_SET", "core").strip().lower()
 
 # Reg->tertile thresholds:
 # fixed = thresholds computed once from all data (matches yield_class construction style better)
@@ -111,7 +113,228 @@ LAG_TE_INTER_COLS = [
     "lag_last_minus_te_region_crop",
     "lag_last_div_te_crop",
     "lag_last_div_te_region_crop",
+    "stress_index",
+    "aod_rain_interaction",
 ]
+
+MODEL_TOURNAMENT_LOG = []
+
+def log_to_tournament(task, model_name, score, params, architecture=None):
+    MODEL_TOURNAMENT_LOG.append({
+        "Task": task,
+        "Model": model_name,
+        "Architecture": architecture if architecture else model_name, # Add this line
+        "Score": round(float(score), 4) if score is not None and np.isfinite(score) else score,
+        "Parameters": str(params)
+    })
+
+
+def get_custom_weights(y) -> np.ndarray:
+    """
+    Higher weight for "extreme" yields (> 1 std away from mean).
+    Returns shape (n_samples,).
+    """
+    y = np.asarray(y, dtype=float).ravel()
+    y_mean = np.nanmean(y)
+    y_std = np.nanstd(y)
+
+    if not np.isfinite(y_std) or y_std <= 1e-12:
+        return np.ones_like(y, dtype=float)
+
+    w = np.where(np.abs(y - y_mean) > y_std, 2.0, 1.0).astype(float)
+    return w
+
+
+# Bagging helps small datasets by training on different 'subsets' of your data
+# and averaging the result, which kills overfitting.
+
+class HeavyClassBalancedClassifier(BaseEstimator, ClassifierMixin):
+    def __init__(self, model):
+        self.model = model
+
+    def fit(self, X, y):
+        # 1. Identify rare classes (Low=0, High=2)
+        classes, counts = np.unique(y, return_counts=True)
+        # 2. Force the model to treat Low/High as 3x more important
+        weights = {0: 3.0, 1: 1.0, 2: 3.0}
+
+        self.model_ = clone(self.model)
+
+        # If the model supports class_weight, set it
+        try:
+            params = getattr(self.model_, "get_params", lambda: {})()
+            if "class_weight" in params:
+                self.model_.set_params(class_weight=weights)
+        except Exception:
+            pass
+
+        self.model_.fit(X, y)
+        self.classes_ = getattr(self.model_, "classes_", np.array([0, 1, 2], dtype=int))
+        return self
+
+    def predict(self, X):
+        return self.model_.predict(X)
+
+    def predict_proba(self, X):
+        if hasattr(self.model_, "predict_proba"):
+            return self.model_.predict_proba(X)
+        raise AttributeError("Underlying model does not support predict_proba().")
+
+
+class SmoteBalancedBaggingClassifier(BaseEstimator, ClassifierMixin):
+    """
+    Implements: SMOTE (synthetic minority oversampling) + Balanced Bagging.
+    Works on already-numeric feature matrices (after your preprocessing).
+    Gracefully falls back if SMOTE can't run in a fold.
+    """
+    def __init__(
+        self,
+        n_estimators: int = 150,
+        max_samples: float = 1.0,
+        max_features: float = 1.0,
+        random_state: int = 42,
+    ):
+        self.n_estimators = int(n_estimators)
+        self.max_samples = float(max_samples)
+        self.max_features = float(max_features)
+        self.random_state = int(random_state)
+
+    def _make_base_tree(self):
+        # Heavy weights for Low/High
+        weights = {0: 3.0, 1: 1.0, 2: 3.0}
+        return DecisionTreeClassifier(random_state=self.random_state, class_weight=weights)
+
+    def _make_bagger(self, base_tree, sampler=None):
+        # Prefer imblearn BalancedBaggingClassifier if available
+        if _IMBLEARN_AVAILABLE and BalancedBaggingClassifier is not None:
+            # Try new API (estimator=, sampler=)
+            try:
+                if sampler is not None:
+                    return BalancedBaggingClassifier(
+                        estimator=base_tree,
+                        n_estimators=self.n_estimators,
+                        max_samples=self.max_samples,
+                        max_features=self.max_features,
+                        random_state=self.random_state,
+                        n_jobs=1,
+                        sampler=sampler,
+                    )
+                return BalancedBaggingClassifier(
+                    estimator=base_tree,
+                    n_estimators=self.n_estimators,
+                    max_samples=self.max_samples,
+                    max_features=self.max_features,
+                    random_state=self.random_state,
+                    n_jobs=1,
+                )
+            except TypeError:
+                # Older API (base_estimator=) and no sampler support
+                try:
+                    return BalancedBaggingClassifier(
+                        base_estimator=base_tree,
+                        n_estimators=self.n_estimators,
+                        max_samples=self.max_samples,
+                        max_features=self.max_features,
+                        random_state=self.random_state,
+                        n_jobs=1,
+                    )
+                except Exception:
+                    pass
+
+        # Fallback: sklearn BaggingClassifier
+        try:
+            return BaggingClassifier(
+                estimator=base_tree,
+                n_estimators=self.n_estimators,
+                max_samples=self.max_samples,
+                max_features=self.max_features,
+                random_state=self.random_state,
+                n_jobs=1,
+            )
+        except TypeError:
+            # older sklearn
+            return BaggingClassifier(
+                base_estimator=base_tree,
+                n_estimators=self.n_estimators,
+                max_samples=self.max_samples,
+                max_features=self.max_features,
+                random_state=self.random_state,
+                n_jobs=1,
+            )
+
+    def fit(self, X, y):
+        y = np.asarray(y).astype(int)
+
+        # Build SMOTE sampler only if it’s feasible in this fold
+        sampler = None
+        X_fit, y_fit = X, y
+
+        if _IMBLEARN_AVAILABLE and SMOTE is not None:
+            classes, counts = np.unique(y, return_counts=True)
+            min_count = int(counts.min()) if len(counts) else 0
+
+            # SMOTE needs min_count >= 2 and k_neighbors <= min_count - 1
+            if min_count >= 2:
+                k = max(1, min(5, min_count - 1))
+                try:
+                    sampler = SMOTE(random_state=self.random_state, k_neighbors=k)
+                except Exception:
+                    sampler = None
+
+        base_tree = self._make_base_tree()
+        bagger = self._make_bagger(base_tree, sampler=sampler)
+
+        # If bagger doesn't support sampler, we manually SMOTE first (when possible)
+        if sampler is not None:
+            try:
+                X_fit, y_fit = sampler.fit_resample(X, y)
+            except Exception:
+                X_fit, y_fit = X, y  # fallback if SMOTE fails in this fold
+
+        bagger.fit(X_fit, y_fit)
+        self.model_ = bagger
+        self.classes_ = getattr(self.model_, "classes_", np.array([0, 1, 2], dtype=int))
+        return self
+
+    def predict(self, X):
+        return self.model_.predict(X)
+
+    def predict_proba(self, X):
+        if hasattr(self.model_, "predict_proba"):
+            return self.model_.predict_proba(X)
+        raise AttributeError("Underlying model does not support predict_proba().")
+
+
+def _supports_sample_weight(est) -> bool:
+    try:
+        return "sample_weight" in inspect.signature(est.fit).parameters
+    except Exception:
+        return False
+
+
+def _fit_with_optional_sample_weight(est, X, y, sample_weight=None, *, pipeline_model_step: str = "model"):
+    """
+    Fits estimators safely with sample_weight when supported.
+    - If est is a Pipeline: passes model__sample_weight to final step.
+    - Otherwise: passes sample_weight directly if supported.
+    """
+    if sample_weight is None:
+        return est.fit(X, y)
+
+    sw = np.asarray(sample_weight, dtype=float).ravel()
+
+    # Pipeline: needs stepname__sample_weight
+    if isinstance(est, Pipeline):
+        model_step = est.named_steps.get(pipeline_model_step, None)
+        if model_step is not None and _supports_sample_weight(model_step):
+            return est.fit(X, y, **{f"{pipeline_model_step}__sample_weight": sw})
+        return est.fit(X, y)
+
+    # Non-pipeline estimator/wrapper
+    if _supports_sample_weight(est):
+        return est.fit(X, y, sample_weight=sw)
+
+    return est.fit(X, y)
 
 
 def _find_lag_cols(X: pd.DataFrame) -> List[Tuple[int, str]]:
@@ -242,25 +465,39 @@ class LagTeInteractionFeatures(BaseEstimator, TransformerMixin):
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         Xdf = X.copy() if isinstance(X, pd.DataFrame) else pd.DataFrame(X).copy()
 
+        # Always ensure all expected columns exist
         for c in LAG_TE_INTER_COLS:
             if c not in Xdf.columns:
                 Xdf[c] = np.nan
 
-        if "yield_lag_last" not in Xdf.columns:
-            return Xdf
-        if not all(c in Xdf.columns for c in ["te_crop", "te_region", "te_region_crop"]):
-            return Xdf
+        # ----------------------------
+        # Existing Lag vs TE interactions
+        # ----------------------------
+        if ("yield_lag_last" in Xdf.columns) and all(c in Xdf.columns for c in ["te_crop", "te_region", "te_region_crop"]):
+            lag_last = pd.to_numeric(Xdf["yield_lag_last"], errors="coerce").to_numpy(dtype=float)
+            te_crop = pd.to_numeric(Xdf["te_crop"], errors="coerce").to_numpy(dtype=float)
+            te_region = pd.to_numeric(Xdf["te_region"], errors="coerce").to_numpy(dtype=float)
+            te_rc = pd.to_numeric(Xdf["te_region_crop"], errors="coerce").to_numpy(dtype=float)
 
-        lag_last = pd.to_numeric(Xdf["yield_lag_last"], errors="coerce").to_numpy(dtype=float)
-        te_crop = pd.to_numeric(Xdf["te_crop"], errors="coerce").to_numpy(dtype=float)
-        te_region = pd.to_numeric(Xdf["te_region"], errors="coerce").to_numpy(dtype=float)
-        te_rc = pd.to_numeric(Xdf["te_region_crop"], errors="coerce").to_numpy(dtype=float)
+            Xdf["lag_last_minus_te_crop"] = lag_last - te_crop
+            Xdf["lag_last_minus_te_region"] = lag_last - te_region
+            Xdf["lag_last_minus_te_region_crop"] = lag_last - te_rc
+            Xdf["lag_last_div_te_crop"] = _safe_div(lag_last, te_crop)
+            Xdf["lag_last_div_te_region_crop"] = _safe_div(lag_last, te_rc)
 
-        Xdf["lag_last_minus_te_crop"] = lag_last - te_crop
-        Xdf["lag_last_minus_te_region"] = lag_last - te_region
-        Xdf["lag_last_minus_te_region_crop"] = lag_last - te_rc
-        Xdf["lag_last_div_te_crop"] = _safe_div(lag_last, te_crop)
-        Xdf["lag_last_div_te_region_crop"] = _safe_div(lag_last, te_rc)
+        # ----------------------------
+        # NEW: Explicit Aerosol-Weather Interactions
+        # Helps classifier detect "stress events"
+        # ----------------------------
+        if "pm2.5 ugm-3" in Xdf.columns and "surface skin temp avg" in Xdf.columns:
+            pm = pd.to_numeric(Xdf["pm2.5 ugm-3"], errors="coerce").to_numpy(dtype=float)
+            t = pd.to_numeric(Xdf["surface skin temp avg"], errors="coerce").to_numpy(dtype=float)
+            Xdf["stress_index"] = pm * t
+
+        if "aod" in Xdf.columns and "90%tile precipitation (mm/day)" in Xdf.columns:
+            aod = pd.to_numeric(Xdf["aod"], errors="coerce").to_numpy(dtype=float)
+            rain = pd.to_numeric(Xdf["90%tile precipitation (mm/day)"], errors="coerce").to_numpy(dtype=float)
+            Xdf["aod_rain_interaction"] = aod / (rain + 1.0)
 
         return Xdf
 
@@ -291,6 +528,25 @@ try:
     XGBRegressor = _XGBRegressor
 except Exception:
     pass
+
+
+def _make_stacking_regressor(best_huber, best_svr, best_hgb):
+    """
+    Huber: robust to outliers
+    SVR: smooth trends
+    HistGB: non-linear aerosol interactions
+    RidgeCV meta-learner decides which base model to trust more.
+    """
+    estimators = [
+        ("huber", best_huber),
+        ("svr", best_svr),
+        ("hgb", best_hgb),
+    ]
+    return StackingRegressor(
+        estimators=estimators,
+        final_estimator=RidgeCV(),
+        cv=5,
+    )
 
 
 # --------------------------
@@ -400,7 +656,7 @@ def _preprocessor(
     # Constant impute prevents CV folds where a feature is all-NaN from blowing up.
     num_steps = [("imputer", _safe_imputer(strategy="constant", fill_value=0.0, add_indicator=True))]
     if scale_numeric:
-        num_steps.append(("scaler", StandardScaler()))
+        num_steps.append(("scaler", RobustScaler()))
     num_pipe = Pipeline(steps=num_steps)
 
     cat_pipe = Pipeline(steps=[
@@ -638,6 +894,40 @@ def _yield_to_class(
     return out
 
 
+# In modeling.py -> Replace the AgricultureStackingClassifier class
+class AgricultureStackingClassifier(BaseEstimator, ClassifierMixin):
+    def __init__(self, clf_model, reg_wrapper):
+        self.clf_model = clf_model
+        self.reg_wrapper = reg_wrapper
+        self.classes_ = np.array([0, 1, 2], dtype=int)
+
+    def fit(self, X, y_combo, sample_weight=None):
+        y_combo = np.asarray(y_combo)
+        y_reg = y_combo[:, 0].astype(float)
+
+        self.clf_model_ = clone(self.clf_model).fit(X, y_combo, sample_weight=sample_weight)
+        self.reg_wrapper_ = clone(self.reg_wrapper).fit(X, y_reg, sample_weight=sample_weight)
+        return self
+
+    def predict_proba(self, X):
+        p_direct = self.clf_model_.predict_proba(X)
+        p_reg = self.reg_wrapper_.predict_proba(X)
+
+        # Bayesian Blend:
+        # - Regressor (Huber->tertiles) is stable (trend)
+        # - Direct model (MLP/XGB) captures aerosol signals
+        # Give reg 70% weight by default, but square direct probs
+        # to reward high-confidence aerosol signals.
+        p_direct_sq = np.power(p_direct, 2)
+        p_direct_sq /= p_direct_sq.sum(axis=1, keepdims=True)
+
+        combined = (0.3 * p_direct_sq) + (0.7 * p_reg)
+        return combined / combined.sum(axis=1, keepdims=True)
+
+    def predict(self, X):
+        return np.argmax(self.predict_proba(X), axis=1).astype(int)
+
+
 @dataclass
 class RegressorToTertileClassifier(BaseEstimator, ClassifierMixin):
     reg_pipeline: Pipeline
@@ -645,7 +935,7 @@ class RegressorToTertileClassifier(BaseEstimator, ClassifierMixin):
     overall_tertiles: Tuple[float, float]
     freeze_tertiles: bool = False
 
-    def fit(self, X: pd.DataFrame, y_reg: np.ndarray) -> "RegressorToTertileClassifier":
+    def fit(self, X: pd.DataFrame, y_reg: np.ndarray, sample_weight=None) -> "RegressorToTertileClassifier":
         y_arr = np.asarray(y_reg)
         if y_arr.ndim == 2:
             y_arr = y_arr[:, 0]
@@ -654,7 +944,13 @@ class RegressorToTertileClassifier(BaseEstimator, ClassifierMixin):
             crops = X["crop"].astype(str).values
             self.per_crop_tertiles, self.overall_tertiles = _compute_crop_tertiles(y_arr.astype(float), crops)
 
-        self.reg_pipeline.fit(X, y_arr.astype(float))
+        fit_kwargs = {}
+        if sample_weight is not None and isinstance(self.reg_pipeline, Pipeline):
+            model_step = self.reg_pipeline.named_steps.get("model", None)
+            if model_step is not None and _supports_sample_weight(model_step):
+                fit_kwargs["model__sample_weight"] = np.asarray(sample_weight, dtype=float).ravel()
+
+        self.reg_pipeline.fit(X, y_arr.astype(float), **fit_kwargs)
         return self
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
@@ -663,9 +959,28 @@ class RegressorToTertileClassifier(BaseEstimator, ClassifierMixin):
         return _yield_to_class(y_hat, crops, self.per_crop_tertiles, self.overall_tertiles)
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        pred = self.predict(X).astype(int)
-        proba = np.zeros((len(pred), 3), dtype=float)
-        proba[np.arange(len(pred)), pred] = 1.0
+        y_hat = self.reg_pipeline.predict(X)
+        crops = X["crop"].astype(str).values
+        n = len(y_hat)
+        proba = np.zeros((n, 3), dtype=float)
+
+        for i in range(n):
+            crop = crops[i]
+            t1, t2 = self.per_crop_tertiles.get(crop, self.overall_tertiles)
+
+            # Adaptive sigma: 1/5th of the medium range (t2 - t1)
+            sigma = max(abs(t2 - t1) / 5.0, 1e-4)
+
+            z0 = np.clip((y_hat[i] - t1) / sigma, -50, 50)
+            z2 = np.clip((t2 - y_hat[i]) / sigma, -50, 50)
+
+            p0 = 1.0 / (1.0 + np.exp(z0))   # low
+            p2 = 1.0 / (1.0 + np.exp(z2))   # high
+            p1 = max(0.01, 1.0 - p0 - p2)   # mid (tiny floor)
+
+            row = np.array([p0, p1, p2], dtype=float)
+            proba[i] = row / row.sum()
+
         return proba
 
 
@@ -698,13 +1013,15 @@ def _make_reg2tert_wrapper(reg_pipe: Pipeline, X: pd.DataFrame, y_reg: np.ndarra
 # --------------------------
 # OOF evaluation (leak-free)
 # --------------------------
-def _oof_eval_regressor(best_pipe: Pipeline, X: pd.DataFrame, y: np.ndarray, cv_splits) -> Dict[str, float]:
+def _oof_eval_regressor(best_pipe: Any, X: pd.DataFrame, y: np.ndarray, cv_splits) -> Dict[str, float]:
     y_pred = np.full(len(y), np.nan, dtype=float)
 
     for tr, te in cv_splits:
         est = clone(best_pipe)
+        sw_tr = get_custom_weights(y[tr])
+
         with threadpool_limits(limits=1):
-            est.fit(X.iloc[tr], y[tr])
+            _fit_with_optional_sample_weight(est, X.iloc[tr], y[tr], sw_tr)
             y_pred[te] = est.predict(X.iloc[te])
 
     mask = np.isfinite(y_pred)
@@ -725,13 +1042,15 @@ def _oof_eval_classifier(best_est: Any, best_info: Dict[str, Any],
 
     for tr, te in cv_splits:
         est = clone(best_est)
+        sw_tr = get_custom_weights(y_reg[tr])
+
         with threadpool_limits(limits=1):
             if best_info.get("approach") == "regression_to_tertiles":
-                est.fit(X.iloc[tr], y_reg[tr])
+                _fit_with_optional_sample_weight(est, X.iloc[tr], y_reg[tr], sw_tr)
             elif best_info.get("fit_y_combo", False):
-                est.fit(X.iloc[tr], y_combo[tr])
+                _fit_with_optional_sample_weight(est, X.iloc[tr], y_combo[tr], sw_tr)
             else:
-                est.fit(X.iloc[tr], y_class[tr])
+                _fit_with_optional_sample_weight(est, X.iloc[tr], y_class[tr], sw_tr)
 
             y_pred[te] = est.predict(X.iloc[te]).astype(int)
 
@@ -860,7 +1179,22 @@ def _classifier_candidates() -> List[_Candidate]:
         ),
         _Candidate(
             name="ExtraTrees",
-            estimator=ExtraTreesClassifier(random_state=rs, n_jobs=1, class_weight="balanced"),
+            estimator=ExtraTreesClassifier(random_state=rs, n_jobs=1),
+            scale_numeric=False,
+            param_space={
+                "model__n_estimators": [600, 1200],
+                "model__max_depth": [6, 8, None],
+                "model__min_samples_split": [10, 20, 30],
+                "model__min_samples_leaf": [5, 10, 20],
+                "model__max_features": ["sqrt", 0.6, 0.8],
+            },
+            n_iter=10 if TUNE_MODE == "fast" else (18 if TUNE_MODE == "metrics" else 35),
+            search_n_jobs=outer_jobs,
+            use_target_mean=False,
+        ),
+        _Candidate(
+            name="RandomForest",
+            estimator=RandomForestClassifier(random_state=rs, n_jobs=1),
             scale_numeric=False,
             param_space={
                 "model__n_estimators": [600, 1200],
@@ -875,11 +1209,27 @@ def _classifier_candidates() -> List[_Candidate]:
         ),
     ]
 
+    cands.append(
+        _Candidate(
+            name="SMOTE+BalancedBagging",
+            estimator=SmoteBalancedBaggingClassifier(random_state=rs),
+            scale_numeric=False,
+            param_space={
+                "model__n_estimators": [80, 150, 250],
+                "model__max_samples": [0.6, 0.8, 1.0],
+                "model__max_features": [0.6, 0.8, 1.0],
+            },
+            n_iter=6 if TUNE_MODE == "fast" else (12 if TUNE_MODE == "metrics" else 20),
+            search_n_jobs=outer_jobs,
+            use_target_mean=False,
+        )
+    )
+
     if TUNE_MODE in {"metrics", "full"}:
         cands.append(
             _Candidate(
                 name="LinearSVC",
-                estimator=LinearSVC(class_weight="balanced", random_state=rs, dual=False, max_iter=50000),
+                estimator=LinearSVC(random_state=rs, dual=False, max_iter=50000),
                 scale_numeric=True,
                 param_space={"model__C": [0.01, 0.03, 0.05, 0.1, 0.3, 1.0, 3.0]},
                 n_iter=10 if TUNE_MODE == "metrics" else 14,
@@ -889,27 +1239,26 @@ def _classifier_candidates() -> List[_Candidate]:
         )
 
     # ✅ Neural network classifier (MLP)
-    # (Needs scaling; TE features are handled by YieldAwareClassifier wrapper.)
     if TUNE_MODE in {"fast", "metrics", "full"}:
         cands.append(
             _Candidate(
                 name="MLP",
                 estimator=MLPClassifier(
                     random_state=rs,
-                    max_iter=1200,
+                    max_iter=1500,
                     early_stopping=True,
-                    n_iter_no_change=20,
+                    n_iter_no_change=25,
                     validation_fraction=0.15,
                 ),
                 scale_numeric=True,
                 param_space={
-                    "model__hidden_layer_sizes": [(64,), (128,), (64, 32), (128, 64)],
+                    "model__hidden_layer_sizes": [(16,), (12, 6)],
                     "model__activation": ["relu", "tanh"],
-                    "model__alpha": [1e-5, 1e-4, 1e-3, 1e-2],
-                    "model__learning_rate_init": [1e-4, 3e-4, 1e-3, 3e-3],
-                    "model__batch_size": [32, 64, 128],
+                    "model__alpha": [0.1, 0.5, 1.0],
+                    "model__learning_rate_init": [3e-4, 1e-3, 3e-3],
+                    "model__batch_size": [16, 32, 64],
                 },
-                n_iter=6 if TUNE_MODE == "fast" else (14 if TUNE_MODE == "metrics" else 26),
+                n_iter=10 if TUNE_MODE == "fast" else 20,
                 search_n_jobs=outer_jobs,
                 use_target_mean=False,
             )
@@ -921,11 +1270,10 @@ def _classifier_candidates() -> List[_Candidate]:
                 name="XGBoost",
                 estimator=XGBClassifier(
                     random_state=rs,
-                    n_estimators=1200,
+                    n_estimators=1000,
+                    tree_method="hist",
                     objective="multi:softprob",
                     num_class=3,
-                    tree_method="hist",
-                    eval_metric="mlogloss",
                     n_jobs=1,
                 ),
                 scale_numeric=False,
@@ -971,8 +1319,23 @@ def _regressor_candidates() -> List[_Candidate]:
         ),
     ]
 
+    # ✅ NEW: HuberRegressor candidate (and Reg2Tertile can try it)
+    cands.append(
+        _Candidate(
+            name="Huber",
+            estimator=HuberRegressor(max_iter=2000),
+            scale_numeric=True,
+            param_space={
+                "model__epsilon": [1.1, 1.35, 1.5, 1.75],
+                "model__alpha": [0.0001, 0.001, 0.01],
+            },
+            n_iter=10,
+            search_n_jobs=outer_jobs,
+            use_target_mean=True,
+        )
+    )
+
     # ✅ Neural network regressor (MLP)
-    # (Needs scaling; TE helps, so keep use_target_mean=True.)
     if TUNE_MODE in {"fast", "metrics", "full"}:
         cands.append(
             _Candidate(
@@ -1026,8 +1389,9 @@ def _regressor_candidates() -> List[_Candidate]:
             )
         )
 
+    # Keep ExtraTrees only for full (heavy), but make SVR available in metrics+full
     if TUNE_MODE == "full":
-        cands.extend([
+        cands.append(
             _Candidate(
                 name="ExtraTrees",
                 estimator=ExtraTreesRegressor(random_state=rs, n_jobs=1),
@@ -1042,7 +1406,11 @@ def _regressor_candidates() -> List[_Candidate]:
                 n_iter=35,
                 search_n_jobs=outer_jobs,
                 use_target_mean=True,
-            ),
+            )
+        )
+
+    if TUNE_MODE in {"metrics", "full"}:
+        cands.append(
             _Candidate(
                 name="SVR_RBF",
                 estimator=SVR(kernel="rbf"),
@@ -1052,13 +1420,195 @@ def _regressor_candidates() -> List[_Candidate]:
                     "model__gamma": ["scale", "auto"],
                     "model__epsilon": [0.03, 0.05, 0.1, 0.2],
                 },
-                n_iter=16,
+                n_iter=10 if TUNE_MODE == "metrics" else 16,
                 search_n_jobs=outer_jobs,
                 use_target_mean=True,
-            ),
-        ])
+            )
+        )
 
     return cands
+
+
+class YieldAwareClassifier(BaseEstimator, ClassifierMixin):
+    def __init__(
+        self,
+        model,
+        numeric_features_base,
+        categorical_features,
+        use_target_mean=True,
+        smoothing=10.0,
+        use_sample_weight=False,
+        sample_weight_power=1.0,
+        scale_numeric=False,
+    ):
+        self.model = model
+        # IMPORTANT: keep same objects (don’t rebuild lists here)
+        self.numeric_features_base = numeric_features_base
+        self.categorical_features = categorical_features
+
+        self.use_target_mean = use_target_mean
+        self.smoothing = float(smoothing)
+        self.use_sample_weight = bool(use_sample_weight)
+        self.sample_weight_power = float(sample_weight_power)
+        self.scale_numeric = bool(scale_numeric)
+
+    def fit(self, X, y, sample_weight=None):
+        y_arr = np.asarray(y)
+        if y_arr.ndim == 2 and y_arr.shape[1] >= 2:
+            y_reg_local = y_arr[:, 0].astype(float)
+            y_class_local = y_arr[:, 1].astype(int)
+        else:
+            # fallback (rare in your pipeline): treat y as both reg + class
+            y_reg_local = y_arr.astype(float)
+            y_class_local = y_arr.astype(int)
+
+        self._lag_stats = LagStatsFeatures()
+        Xt = self._lag_stats.fit_transform(X)
+
+        if self.use_target_mean:
+            self._te = GroupTargetMeanFeatures(smoothing=self.smoothing)
+            Xt = self._te.fit_transform(Xt, y_reg_local)
+            self._lag_te = LagTeInteractionFeatures()
+            Xt = self._lag_te.fit_transform(Xt)
+        else:
+            self._te = None
+            self._lag_te = None
+
+        numeric_final = list(self.numeric_features_base) + list(LAG_STATS_COLS)
+        if self.use_target_mean:
+            numeric_final += list(TE_COLS) + list(LAG_TE_INTER_COLS)
+
+        numeric_final = [c for c in dict.fromkeys(numeric_final) if c in Xt.columns]
+
+        self._pre = _preprocessor(numeric_final, self.categorical_features, scale_numeric=self.scale_numeric)
+        Xp = self._pre.fit_transform(Xt)
+
+        self.model_ = clone(self.model)
+
+        # Keep class_weight logic (safe: try/except)
+        classes = np.unique(y_class_local)
+        weights = compute_class_weight("balanced", classes=classes, y=y_class_local)
+
+        # Multiply Low (0) and High (2) weights by 2.0; keep Mid (1) unchanged
+        weight_dict = {
+            int(c): float(w) * (2.5 if int(c) != 1 else 1.0)
+            for c, w in zip(classes, weights)
+        }
+
+
+        # ✅ XGBoost multiclass: skip class_weight to avoid "parameter not used" warnings
+        is_xgb = (XGBClassifier is not None and isinstance(self.model_, XGBClassifier))
+        if (not is_xgb) and hasattr(self.model_, "set_params"):
+            try:
+                self.model_.set_params(class_weight=weight_dict)
+            except Exception:
+                pass
+        
+
+
+        # --- NEW: combine "extreme yield" weights with class-balancing sample_weight ---
+        # If caller provided sample_weight, use it (already sliced by CV). Otherwise compute from yield.
+        extreme_w = (
+            np.asarray(sample_weight, dtype=float).ravel()
+            if sample_weight is not None
+            else get_custom_weights(y_reg_local)
+        )
+
+        fit_kwargs = {}
+        if self.use_sample_weight:
+            sw_class = compute_sample_weight(class_weight="balanced", y=y_class_local).astype(float)
+            sw = sw_class * extreme_w
+            if self.sample_weight_power != 1.0:
+                sw = np.power(sw, self.sample_weight_power)
+            fit_kwargs["sample_weight"] = sw
+        else:
+            # even if you disable class-weights, still allow extreme-yield weighting
+            fit_kwargs["sample_weight"] = extreme_w
+
+        try:
+            if is_xgb:
+                # ✅ pass eval_metric in fit (not constructor) to avoid warnings
+                try:
+                    self.model_.fit(Xp, y_class_local, eval_metric="mlogloss", **fit_kwargs)
+                except TypeError: 
+                    # older/newer API mismatch: retry without eval_metric but keep sample_weight
+                    self.model_.fit(Xp, y_class_local, **fit_kwargs)
+            else:
+                self.model_.fit(Xp, y_class_local, **fit_kwargs)
+        except TypeError:
+            # model doesn't support sample_weight
+            self.model_.fit(Xp, y_class_local)
+
+        self.classes_ = getattr(self.model_, "classes_", np.array([0, 1, 2], dtype=int))
+        return self
+
+    def _transform(self, X):
+        Xt = self._lag_stats.transform(X)
+        if self._te is not None:
+            Xt = self._te.transform(Xt)
+            Xt = self._lag_te.transform(Xt)
+        return self._pre.transform(Xt)
+
+    def predict(self, X):
+        return self.model_.predict(self._transform(X))
+
+    def predict_proba(self, X):
+        Xt = self._transform(X)
+        if hasattr(self.model_, "predict_proba"):
+            return self.model_.predict_proba(Xt)
+        raise AttributeError("Underlying model does not support predict_proba()")
+
+
+class WeightedSoftVoteEnsemble(BaseEstimator, ClassifierMixin):
+    """
+    Weighted average of predict_proba from two probabilistic classifiers.
+    If both agree (e.g., both predict class 0), the averaged probability is very high.
+    """
+    def __init__(self, est_a, est_b, weight_a: float = 1.0, weight_b: float = 1.0):
+        self.est_a = est_a
+        self.est_b = est_b
+        self.weight_a = float(weight_a)
+        self.weight_b = float(weight_b)
+
+    def fit(self, X, y):
+        self.est_a_ = clone(self.est_a)
+        self.est_b_ = clone(self.est_b)
+
+        self.est_a_.fit(X, y)
+        self.est_b_.fit(X, y)
+
+        ca = np.asarray(getattr(self.est_a_, "classes_", np.array([0, 1, 2], dtype=int)))
+        cb = np.asarray(getattr(self.est_b_, "classes_", np.array([0, 1, 2], dtype=int)))
+        self.classes_ = np.unique(np.concatenate([ca, cb])).astype(int)
+        return self
+
+    def _align(self, proba: np.ndarray, src_classes: np.ndarray) -> np.ndarray:
+        out = np.zeros((proba.shape[0], len(self.classes_)), dtype=float)
+        for j, c in enumerate(src_classes):
+            idx = int(np.where(self.classes_ == int(c))[0][0])
+            out[:, idx] = proba[:, j]
+        return out
+
+    def predict_proba(self, X):
+        if not hasattr(self.est_a_, "predict_proba") or not hasattr(self.est_b_, "predict_proba"):
+            raise AttributeError("Both base estimators must support predict_proba().")
+
+        pa = self.est_a_.predict_proba(X)
+        pb = self.est_b_.predict_proba(X)
+
+        ca = np.asarray(getattr(self.est_a_, "classes_", self.classes_))
+        cb = np.asarray(getattr(self.est_b_, "classes_", self.classes_))
+
+        pa = self._align(pa, ca)
+        pb = self._align(pb, cb)
+
+        wa = max(1e-9, float(self.weight_a))
+        wb = max(1e-9, float(self.weight_b))
+        return (wa * pa + wb * pb) / (wa + wb)
+
+    def predict(self, X):
+        p = self.predict_proba(X)
+        return self.classes_[np.argmax(p, axis=1)].astype(int)
 
 
 # --------------------------
@@ -1066,6 +1616,12 @@ def _regressor_candidates() -> List[_Candidate]:
 # --------------------------
 def tune_classifier(panel: pd.DataFrame, feature_cols: List[str], out_dir: Path) -> Tuple[Any, Dict[str, Any]]:
     _suppress_noisy_warnings()
+
+    # NEW: reset tournament log for this run
+    try:
+        MODEL_TOURNAMENT_LOG.clear()
+    except Exception:
+        pass
 
     mask = _clean_mask_for_task(panel, feature_cols, task="clf")
     df = panel.loc[mask].sort_values("year").reset_index(drop=True)
@@ -1118,99 +1674,29 @@ def tune_classifier(panel: pd.DataFrame, feature_cols: List[str], out_dir: Path)
         X, numeric_features_all, cv_splits=cv_splits, task="clf", y_reg=y_reg, y_class=y_class
     )
 
-    # ============================================================
     # Direct classifier gets TE + lag/TE interactions too
     # We fit on y_combo = [yield, class] so TE uses yield leak-free.
-    # ============================================================
     y_combo = np.column_stack([y_reg.astype(float), y_class.astype(int)])
+    extreme_sw = get_custom_weights(y_reg)
+
     f1_combo_scorer = make_scorer(_f1_macro_from_combo_y, greater_is_better=True)
 
     # optional sample weights (balanced)
     USE_SAMPLE_WEIGHT = True
     SAMPLE_WEIGHT_POWER = 1.0
 
-    class YieldAwareClassifier(BaseEstimator, ClassifierMixin):
-        def __init__(self, model, numeric_features_base, categorical_features,
-                    use_target_mean=True, smoothing=10.0, use_sample_weight=False, sample_weight_power=1.0,
-                    scale_numeric=False):
-            self.model = model
-        # IMPORTANT: do NOT copy these lists, sklearn.clone needs same object identity
-            self.numeric_features_base = numeric_features_base
-            self.categorical_features = categorical_features
-
-            self.use_target_mean = use_target_mean
-            self.smoothing = float(smoothing)
-            self.use_sample_weight = bool(use_sample_weight)
-            self.sample_weight_power = float(sample_weight_power)
-            self.scale_numeric = bool(scale_numeric)
-
-
-        def fit(self, X, y):
-            y_arr = np.asarray(y)
-            if y_arr.ndim == 2 and y_arr.shape[1] >= 2:
-                y_reg_local = y_arr[:, 0].astype(float)
-                y_class_local = y_arr[:, 1].astype(int)
-            else:
-                y_reg_local = y_arr.astype(float)
-                y_class_local = y_arr.astype(int)
-
-            self._lag_stats = LagStatsFeatures()
-            Xt = self._lag_stats.fit_transform(X)
-
-            if self.use_target_mean:
-                self._te = GroupTargetMeanFeatures(smoothing=self.smoothing)
-                Xt = self._te.fit_transform(Xt, y_reg_local)
-                self._lag_te = LagTeInteractionFeatures()
-                Xt = self._lag_te.fit_transform(Xt)
-            else:
-                self._te = None
-                self._lag_te = None
-
-            numeric_final = list(self.numeric_features_base) + list(LAG_STATS_COLS)
-            if self.use_target_mean:
-                numeric_final += list(TE_COLS) + list(LAG_TE_INTER_COLS)
-
-            # only keep cols actually present (prevents KeyError)
-            numeric_final = [c for c in dict.fromkeys(numeric_final) if c in Xt.columns]
-
-            self._pre = _preprocessor(numeric_final, self.categorical_features, scale_numeric=self.scale_numeric)
-            Xp = self._pre.fit_transform(Xt)
-
-            self.model_ = clone(self.model)
-
-            fit_kwargs = {}
-            if self.use_sample_weight:
-                sw = compute_sample_weight(class_weight="balanced", y=y_class_local)
-                if self.sample_weight_power != 1.0:
-                    sw = np.power(sw, self.sample_weight_power)
-                fit_kwargs["sample_weight"] = sw
-
-            try:
-                self.model_.fit(Xp, y_class_local, **fit_kwargs)
-            except TypeError:
-                self.model_.fit(Xp, y_class_local)
-
-            return self
-
-        def _transform(self, X):
-            Xt = self._lag_stats.transform(X)
-            if self._te is not None:
-                Xt = self._te.transform(Xt)
-                Xt = self._lag_te.transform(Xt)
-            return self._pre.transform(Xt)
-
-        def predict(self, X):
-            return self.model_.predict(self._transform(X))
-
-        def predict_proba(self, X):
-            Xt = self._transform(X)
-            if hasattr(self.model_, "predict_proba"):
-                return self.model_.predict_proba(Xt)
-            raise AttributeError("Underlying model does not support predict_proba()")
-
     failures = []
     best_est = None
     best_info: Dict[str, Any] = {"best_score": -np.inf}
+
+    # Track best tuned HistGB + MLP for ensemble
+    best_histgb_est = None
+    best_histgb_cv = -np.inf
+    best_mlp_est = None
+    best_mlp_cv = -np.inf
+    best_direct_est = None
+    best_direct_cv = -np.inf
+    best_direct_name = None
 
     # A) Yield-aware direct classifiers
     for cand in _classifier_candidates():
@@ -1246,14 +1732,42 @@ def tune_classifier(panel: pd.DataFrame, feature_cols: List[str], out_dir: Path)
 
         try:
             with threadpool_limits(limits=1):
-                search.fit(X, y_combo)
+                search.fit(X, y_combo, sample_weight=extreme_sw)
         except Exception as e:
             failures.append({"model": cand.name, "error": f"{type(e).__name__}: {e}"})
             continue
 
+        # NEW: log every tried config for this candidate
+        try:
+            results = search.cv_results_
+            for i in range(len(results["params"])):
+                log_to_tournament(
+                    "Classification",
+                    f"{cand.name} (Variant {i})",
+                    results["mean_test_score"][i],
+                    results["params"][i],
+                    architecture=cand.name
+                )
+        except Exception:
+            pass
+
         score_cv_mean = float(search.best_score_) if search.best_score_ is not None else float("nan")
+        if score_cv_mean > best_direct_cv:
+            best_direct_cv = score_cv_mean
+            best_direct_est = search.best_estimator_
+            best_direct_name = cand.name
+
         if not np.isfinite(score_cv_mean):
             continue
+
+        # keep the tuned best HistGB and MLP so we can ensemble them later
+        if cand.name == "HistGB" and score_cv_mean > best_histgb_cv:
+            best_histgb_cv = score_cv_mean
+            best_histgb_est = search.best_estimator_
+
+        if cand.name == "MLP" and score_cv_mean > best_mlp_cv:
+            best_mlp_cv = score_cv_mean
+            best_mlp_est = search.best_estimator_
 
         if score_cv_mean > float(best_info["best_score"]):
             best_est = search.best_estimator_
@@ -1274,8 +1788,11 @@ def tune_classifier(panel: pd.DataFrame, feature_cols: List[str], out_dir: Path)
     # B) Reg->Tertile remains available
     reg2tert_best_est = None
     reg2tert_best_info: Dict[str, Any] = {"best_score": -np.inf}
+    reg2tert_huber_best_est = None
+    reg2tert_huber_best_info: Dict[str, Any] = {"best_score": -np.inf}
 
-    reg_cands = [c for c in _regressor_candidates() if c.name in {"HistGB", "XGBoost", "MLP"}]
+    # Let Reg2Tertile try Huber too
+    reg_cands = [c for c in _regressor_candidates() if c.name in {"HistGB", "XGBoost", "MLP", "Huber"}]
 
     numeric_features_reg2tert = _with_lag_stats(numeric_features_base)
     if USE_TARGET_MEAN:
@@ -1315,10 +1832,24 @@ def tune_classifier(panel: pd.DataFrame, feature_cols: List[str], out_dir: Path)
 
         try:
             with threadpool_limits(limits=1):
-                search.fit(X, y_combo)
+                search.fit(X, y_combo, sample_weight=extreme_sw)
         except Exception as e:
             failures.append({"model": f"REG2TERT::{rc.name}", "error": f"{type(e).__name__}: {e}"})
             continue
+
+        # NEW: log every tried config for this reg2tert candidate
+        try:
+            results = search.cv_results_
+            for i in range(len(results["params"])):
+                log_to_tournament(
+                    "Classification",
+                    f"Reg2Tertile({rc.name}) (Variant {i})",
+                    results["mean_test_score"][i],
+                    results["params"][i],
+                    architecture=f"Reg2Tertile({rc.name})"
+                )
+        except Exception:
+            pass
 
         score_cv_mean = float(search.best_score_) if search.best_score_ is not None else float("nan")
         if not np.isfinite(score_cv_mean):
@@ -1336,24 +1867,163 @@ def tune_classifier(panel: pd.DataFrame, feature_cols: List[str], out_dir: Path)
                 "best_score": score_cv_mean,  # temporary; replaced by OOF
             }
 
-    if reg2tert_best_est is not None and float(reg2tert_best_info["best_score"]) > float(best_info.get("best_score", -np.inf)):
+        if rc.name == "Huber" and score_cv_mean > float(reg2tert_huber_best_info["best_score"]):
+            reg2tert_huber_best_est = search.best_estimator_
+            reg2tert_huber_best_info = {
+                "task": "classification",
+                "approach": "regression_to_tertiles",
+                "best_model": f"Reg2Tertile({rc.name})",
+                "best_score_cv_mean_f1_macro": score_cv_mean,
+                "best_params": search.best_params_,
+                "numeric_features_used": list(numeric_features_reg2tert),
+                "best_score": score_cv_mean,  # temporary; replaced by OOF
+            }
+
+    # ✅ True Winner selection logic (requested style)
+    current_best_score = float(best_info.get("best_score", -np.inf))
+    if reg2tert_best_est is not None and float(reg2tert_best_info.get("best_score", -np.inf)) > current_best_score:
         best_est = reg2tert_best_est
         best_info = reg2tert_best_info
+        print(f"Selecting Reg2Tertile as winner: {best_info['best_model']}")
 
     if best_est is None:
         raise RuntimeError(f"All classifier candidates failed (or produced NaN scores). Failures={failures}")
 
+    # --------------------------------------------
+    # OOF selection
+    # --------------------------------------------
+    oof_best = _oof_eval_classifier(best_est, best_info, X, y_class, y_reg, cv_splits=cv_splits)
+
+    # Build Stacking only if we have a direct classifier AND it supports predict_proba
+    if best_direct_est is not None:
+        try:
+            # Guard: stacking needs proba from the direct classifier
+            if not hasattr(best_direct_est, "predict_proba"):
+                raise TypeError("best_direct_est does not support predict_proba()")
+
+            # quick smoke test (some models have the method but still raise)
+            _ = best_direct_est.predict_proba(X.iloc[:2])
+
+            # 1) Tune a Huber regressor (continuous logic) on the same CV splits
+            numeric_features_huber = _with_lag_stats(numeric_features_base)
+            if USE_TARGET_MEAN:
+                numeric_features_huber = _with_te(numeric_features_huber)
+                numeric_features_huber = _with_lag_te_interactions(numeric_features_huber)
+
+            huber_pre = _preprocessor(numeric_features_huber, categorical_features, scale_numeric=True)
+
+            huber_steps = [("lag_stats", LagStatsFeatures())]
+            if USE_TARGET_MEAN:
+                huber_steps.append(("target_means", GroupTargetMeanFeatures(smoothing=TARGET_MEAN_SMOOTHING)))
+                huber_steps.append(("lag_te_inter", LagTeInteractionFeatures()))
+            huber_steps += [("preprocess", huber_pre), ("model", HuberRegressor(max_iter=2000))]
+            huber_pipe = Pipeline(huber_steps)
+
+            huber_param_space = {
+                "model__epsilon": [1.1, 1.35, 1.5, 1.75],
+                "model__alpha": [0.0001, 0.001, 0.01],
+            }
+
+            n_jobs_outer = _default_outer_jobs()
+            huber_search = RandomizedSearchCV(
+                huber_pipe,
+                param_distributions=huber_param_space,
+                n_iter=_cap_n_iter(huber_param_space, 10),
+                scoring="r2",
+                cv=cv_splits,
+                random_state=CONFIG.random_state,
+                n_jobs=n_jobs_outer,
+                verbose=1,
+                pre_dispatch=max(1, 2 * n_jobs_outer),
+                error_score=np.nan,
+                refit=True,
+            )
+
+            with threadpool_limits(limits=1):
+                huber_search.fit(X, y_reg, model__sample_weight=extreme_sw)
+
+            # Log every tried huber config (for the hybrid stack)
+            try:
+                results = huber_search.cv_results_
+                for i in range(len(results["params"])):
+                    log_to_tournament(
+                        "Regression_Huber_For_Stacking",
+                        f"Huber (Variant {i})",
+                        results["mean_test_score"][i],  # CV R2 here
+                        results["params"][i],
+                        architecture="Huber"
+                    )
+            except Exception:
+                pass
+
+            best_huber_pipe = huber_search.best_estimator_
+
+            # 2) Wrap Huber -> tertile probabilities (fixed/strict handled inside wrapper)
+            huber_reg2tert = _make_reg2tert_wrapper(best_huber_pipe, X, y_reg)
+
+            # 3) Stacking candidate (direct classifier + huber->tertiles)
+            stack_est = AgricultureStackingClassifier(
+                clf_model=best_direct_est,
+                reg_wrapper=huber_reg2tert,
+            )
+
+            stack_info = {
+                "task": "classification",
+                "approach": "stacking_direct_plus_reg2tert_huber",
+                "fit_y_combo": True,
+                "best_model": f"AgricultureStackingClassifier(direct={best_direct_name}, reg=Reg2Tertile(Huber))",
+                "best_params": {
+                    "direct_from": "best_direct_est",
+                    "huber_best_params": huber_search.best_params_,
+                    "tertiles_mode": TERTILES_MODE,
+                    "blend": "bayesian_rank_weight",
+                    "weights": {"direct_weight": 0.3, "reg_weight": 0.7, "direct_power": 2},
+                },
+                "numeric_features_used": list(numeric_features_base) + list(LAG_STATS_COLS) + (
+                    list(TE_COLS) + list(LAG_TE_INTER_COLS) if USE_TARGET_MEAN else []
+                ),
+                "best_score": float("nan"),  # replaced by OOF below
+            }
+
+            oof_stack = _oof_eval_classifier(stack_est, stack_info, X, y_class, y_reg, cv_splits=cv_splits)
+
+            if float(oof_stack.get("oof_f1_macro", -np.inf)) > float(oof_best.get("oof_f1_macro", -np.inf)):
+                best_est = stack_est
+                best_info = stack_info
+                oof_best = oof_stack
+
+        except Exception as e:
+            failures.append({"model": "HYBRID::Stacking", "error": f"{type(e).__name__}: {e}"})
+
+    try:
+        current_best_oof = float(oof_best.get("oof_f1_macro", 0.0))
+        baseline_f1 = 0.167  # From your report
+
+        # Only fallback if the model is performing near random guessing
+        if current_best_oof < (baseline_f1 + 0.1) and reg2tert_huber_best_est is not None:
+            print("Model failed to beat baseline significantly. Falling back to Huber.")
+            best_est = reg2tert_huber_best_est
+            best_info = reg2tert_huber_best_info
+            oof_best = _oof_eval_classifier(best_est, best_info, X, y_class, y_reg, cv_splits=cv_splits)
+        else:
+            # Keep the best OOF performer (even if train-gap exists)
+            pass
+
+    except Exception as e:
+        failures.append({"model": "BASELINE_FALLBACK", "error": f"{type(e).__name__}: {e}"})
+
     # final fit
     if best_info.get("approach") == "regression_to_tertiles":
-        best_est.fit(X, y_reg)
+        _fit_with_optional_sample_weight(best_est, X, y_reg, extreme_sw)
     elif best_info.get("fit_y_combo", False):
-        best_est.fit(X, y_combo)
+        _fit_with_optional_sample_weight(best_est, X, y_combo, extreme_sw)
     else:
-        best_est.fit(X, y_class)
+        _fit_with_optional_sample_weight(best_est, X, y_class, extreme_sw)
 
     y_pred = best_est.predict(X)
 
-    oof = _oof_eval_classifier(best_est, best_info, X, y_class, y_reg, cv_splits=cv_splits)
+    # reuse (possibly hybrid) OOF computed above
+    oof = oof_best
 
     best_info.update({
         "train_accuracy": float(accuracy_score(y_class, y_pred)),
@@ -1380,10 +2050,18 @@ def tune_classifier(panel: pd.DataFrame, feature_cols: List[str], out_dir: Path)
     info_path.write_text(json.dumps(best_info, indent=2), encoding="utf-8")
     joblib.dump(best_est, model_path)
 
+    # Save tournament log to CSV at the end of the function
+    try:
+        tournament_df = pd.DataFrame(MODEL_TOURNAMENT_LOG)
+        tournament_df.to_csv(out_dir / "model_tournament.csv", index=False)
+    except Exception:
+        pass
+
     return best_est, best_info
 
 
-def tune_regressor(panel: pd.DataFrame, feature_cols: List[str], out_dir: Path) -> Tuple[Pipeline, Dict[str, Any]]:
+
+def tune_regressor(panel: pd.DataFrame, feature_cols: List[str], out_dir: Path) -> Tuple[Any, Dict[str, Any]]:
     _suppress_noisy_warnings()
 
     mask = _clean_mask_for_task(panel, feature_cols, task="reg")
@@ -1450,9 +2128,18 @@ def tune_regressor(panel: pd.DataFrame, feature_cols: List[str], out_dir: Path) 
 
     reg_cands = _regressor_candidates()
 
-    best: Optional[Pipeline] = None
+    best: Optional[Any] = None
     best_info: Dict[str, Any] = {"best_score": -np.inf}
     failures: List[Dict[str, str]] = []
+
+    best_huber_pipe = None
+    best_huber_cv = -np.inf
+
+    best_svr_pipe = None
+    best_svr_cv = -np.inf
+
+    best_hgb_pipe = None
+    best_hgb_cv = -np.inf
 
     for cand in reg_cands:
         est = _force_single_thread(cand.estimator)
@@ -1487,8 +2174,12 @@ def tune_regressor(panel: pd.DataFrame, feature_cols: List[str], out_dir: Path) 
         )
 
         try:
+            fit_kwargs = {}
+            if _supports_sample_weight(est):
+                fit_kwargs["model__sample_weight"] = get_custom_weights(y)
+
             with threadpool_limits(limits=1):
-                search.fit(X, y)
+                search.fit(X, y, **fit_kwargs)
         except Exception as e:
             failures.append({"model": cand.name, "error": f"{type(e).__name__}: {e}"})
             continue
@@ -1496,6 +2187,26 @@ def tune_regressor(panel: pd.DataFrame, feature_cols: List[str], out_dir: Path) 
         score_cv_mean = float(search.best_score_) if search.best_score_ is not None else float("nan")
         if not np.isfinite(score_cv_mean):
             continue
+
+        # Track best SVR + best HistGB so we can build an ensemble later
+        try:
+            fitted_pipe = search.best_estimator_
+            model_step = fitted_pipe.named_steps.get("model", None)
+
+            if isinstance(model_step, HuberRegressor) and score_cv_mean > best_huber_cv:
+                best_huber_cv = score_cv_mean
+                best_huber_pipe = fitted_pipe
+
+            if isinstance(model_step, SVR) and score_cv_mean > best_svr_cv:
+                best_svr_cv = score_cv_mean
+                best_svr_pipe = fitted_pipe
+
+            if isinstance(model_step, HistGradientBoostingRegressor) and score_cv_mean > best_hgb_cv:
+                best_hgb_cv = score_cv_mean
+                best_hgb_pipe = fitted_pipe
+
+        except Exception:
+            pass
 
         if score_cv_mean > float(best_info["best_score"]):
             best = search.best_estimator_
@@ -1518,10 +2229,52 @@ def tune_regressor(panel: pd.DataFrame, feature_cols: List[str], out_dir: Path) 
     if best is None:
         raise RuntimeError("All regressor candidates failed (or produced NaN scores).")
 
-    best.fit(X, y)
-    y_pred = best.predict(X)
+    # OOF for the single best model
+    oof_best = _oof_eval_regressor(best, X, y, cv_splits=cv_splits)
+    final = best
+    final_info = best_info
+    final_oof = oof_best
 
-    oof = _oof_eval_regressor(best, X, y, cv_splits=cv_splits)
+    # Build + test STACKING ensemble AFTER individual models are tuned
+    if (best_huber_pipe is not None) and (best_svr_pipe is not None) and (best_hgb_pipe is not None):
+        stack_reg = _make_stacking_regressor(best_huber_pipe, best_svr_pipe, best_hgb_pipe)
+
+        oof_stack = _oof_eval_regressor(stack_reg, X, y, cv_splits=cv_splits)
+
+        # Pick whichever is better by OOF R2
+        if float(oof_stack.get("oof_r2", -np.inf)) > float(final_oof.get("oof_r2", -np.inf)):
+            final = stack_reg
+            final_oof = oof_stack
+            final_info = {
+                "task": "regression",
+                "best_model": "stacking_regressor(huber+svr+hgb)+RidgeCV",
+                "best_score_cv_mean_r2": None,
+                "best_params": {
+                    "huber_from": "best_huber_pipe",
+                    "svr_from": "best_svr_pipe",
+                    "hgb_from": "best_hgb_pipe",
+                    "final_estimator": "RidgeCV()",
+                    "cv": 5,
+                },
+                "n_samples": int(len(X)),
+                "n_features_numeric_used": None,
+                "numeric_features_used": None,
+                "dropped_numeric_allnan_or_constant": dropped_allnan_const,
+                "outer_n_jobs": None,
+                "cv_n_splits": int(CONFIG.cv.n_splits),
+                "model_failures": failures,
+                "feature_set_info": feature_set_info,
+                "best_score": float(oof_stack.get("oof_r2", float("nan"))),
+            }
+
+    # Now fit the chosen final model on full data and compute train metrics
+    _fit_with_optional_sample_weight(final, X, y, get_custom_weights(y))
+
+    y_pred = final.predict(X)
+
+    best = final
+    best_info = final_info
+    oof = final_oof
 
     best_info.update({
         "train_rmse": float(np.sqrt(mean_squared_error(y, y_pred))),
@@ -1551,7 +2304,7 @@ def tune_regressor(panel: pd.DataFrame, feature_cols: List[str], out_dir: Path) 
 def compute_permutation_importance(
     panel: pd.DataFrame,
     feature_cols: List[str],
-    fitted_model: Optional[Pipeline] = None,
+    fitted_model: Optional[Any] = None,
     *,
     # backward-compat alias (run_pipeline.py passes model=...)
     model: Optional[Any] = None,
@@ -1624,7 +2377,6 @@ def compute_permutation_importance(
         .reset_index(drop=True)
     )
     return imp_df
-
 
 
 def compute_gb_feature_importance(

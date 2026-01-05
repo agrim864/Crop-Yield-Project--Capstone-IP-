@@ -1,0 +1,4 @@
+crop,method,n_classes,n_rows
+maize,tertiles(3-class),3,84
+rice,tertiles(3-class),3,84
+wheat,tertiles(3-class),3,84

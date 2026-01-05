@@ -1,0 +1,8 @@
+Executive Summary (auto-draft)
+- Data: 4 regions × 3 crops, years 2000–2020, N=252 rows.
+- Tasks: (1) yield regression, (2) 3-tier yield risk classification (per-crop tertiles when feasible).
+- Leak-safe validation: year-forward CV (n_splits=4) holding out years: 2017, 2018, 2019, 2020.
+- Best regression (combined): OOF R²=0.624, OOF RMSE=0.552.
+- Best classification (combined): OOF accuracy=0.127, OOF macro-F1=0.142.
+- Key conclusion: yield is strongly driven by lag/context; aerosol signals provide incremental predictive value (see ablation table).
+- Backtest: see outputs/report_addons/backtest_metrics_mean_std.csv (mean±std across backtest years).

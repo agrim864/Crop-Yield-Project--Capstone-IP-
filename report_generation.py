@@ -92,6 +92,7 @@ def write_summary(outputs_dir: Path) -> None:
         lines.append("Dataset: (panel_dataset_cleaned.csv not found)")
         lines.append("")
 
+
     lines.append("Baselines:")
     lines.append(f"- Classifier macro-F1: {_fmt(base.get('baseline_clf_macro_f1'))}")
     lines.append(f"- Regressor RMSE: {_fmt(base.get('baseline_reg_rmse'))}")
@@ -133,6 +134,35 @@ def write_summary(outputs_dir: Path) -> None:
         lines.append("Pipeline timing: (timing_summary.csv not found)")
         lines.append("")
 
+    # NEW: Global model leaderboard (from tournament log)
+    tournament_path = outputs_dir / "model_tournament.csv"
+    if tournament_path.exists():
+        try:
+            tourney = pd.read_csv(tournament_path)
+            if not tourney.empty and {"Model", "Score"}.issubset(set(tourney.columns)):
+                tourney = tourney.copy()
+                tourney["Score"] = pd.to_numeric(tourney["Score"], errors="coerce")
+                top_10 = tourney.sort_values("Score", ascending=False).head(10)
+
+                lines.append("=" * 30)
+                lines.append("🏆 GLOBAL MODEL LEADERBOARD")
+                lines.append("=" * 30)
+                lines.append(top_10[["Model", "Score"]].to_string(index=False))
+                lines.append("")
+        except Exception:
+            pass
+
+    tournament_path = outputs_dir / "model_tournament.csv"
+    if tournament_path.exists():
+        tourney = pd.read_csv(tournament_path)
+        lines.append("\n" + "="*40)
+        lines.append("🏆 GLOBAL ARCHITECTURE LEADERBOARD")
+        lines.append("="*40)
+        
+        # Best per Architecture summary
+        leaderboard = tourney.groupby(['Task', 'Architecture'])['Score'].max().sort_values(ascending=False).reset_index()
+        lines.append(leaderboard.to_string(index=False))
+        
     lines.append("Outputs written:")
     lines.append(f"- {outputs_dir / 'panel_dataset_cleaned.csv'}")
     lines.append(f"- {outputs_dir / 'metrics_summary.csv'}")

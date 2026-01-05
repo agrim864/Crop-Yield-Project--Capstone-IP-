@@ -1,0 +1,2 @@
+top_k,avg_pairwise_jaccard,min_pairwise_jaccard,max_pairwise_jaccard
+12,0.4676338281601439,0.2631578947368421,0.8461538461538461

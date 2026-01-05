@@ -1,23 +1,18 @@
 {
   "task": "regression",
-  "best_model": "SVR_RBF",
-  "best_score_cv_mean_r2": 0.7355418777378696,
+  "best_model": "Huber",
+  "best_score_cv_mean_r2": 0.7700100798176353,
   "best_params": {
-    "model__gamma": "auto",
-    "model__epsilon": 0.03,
-    "model__C": 10.0
+    "model__epsilon": 1.1,
+    "model__alpha": 0.01
   },
   "n_samples": 252,
-  "n_features_numeric_used": 38,
+  "n_features_numeric_used": 36,
   "numeric_features_used": [
     "90%tile precipitation (mm/day)",
     "aod",
-    "ch4 avg (ppbv)",
     "ch4 day (ppbv)",
-    "ch4 night (ppbv)",
-    "co sfc conc (ppbv)",
     "pm2.5 ugm-3",
-    "surface skin temp avg",
     "surface skin temp day",
     "surface skin temp night",
     "yield_lag1",
@@ -47,61 +42,29 @@
     "lag_last_minus_te_region",
     "lag_last_minus_te_region_crop",
     "lag_last_div_te_crop",
-    "lag_last_div_te_region_crop"
+    "lag_last_div_te_region_crop",
+    "stress_index",
+    "aod_rain_interaction"
   ],
   "dropped_numeric_allnan_or_constant": [],
-  "outer_n_jobs": 4,
+  "outer_n_jobs": 3,
   "cv_n_splits": 4,
   "model_failures": [],
   "feature_set_info": {
-    "feature_set_mode": "auto",
-    "missing_threshold": 0.6,
-    "feature_set_cv_score": 0.55132756458805,
-    "n_numeric_selected": 13,
-    "all_candidates": [
-      {
-        "thr": 0.6,
-        "score": 0.55132756458805,
-        "n_numeric": 13
-      },
-      {
-        "thr": 0.5,
-        "score": 0.5464974446997933,
-        "n_numeric": 12
-      },
-      {
-        "thr": 0.7,
-        "score": 0.5392333666649918,
-        "n_numeric": 16
-      },
-      {
-        "thr": 0.35,
-        "score": 0.5382319972785049,
-        "n_numeric": 9
-      },
-      {
-        "thr": 0.85,
-        "score": 0.528947129301835,
-        "n_numeric": 35
-      },
-      {
-        "thr": 0.25,
-        "score": 0.5124754443341992,
-        "n_numeric": 6
-      }
-    ]
+    "feature_set_mode": "forced",
+    "missing_threshold": 0.35
   },
-  "best_score": 0.7346572429237611,
-  "train_rmse": 0.2714046787452761,
-  "train_r2": 0.8648095718335065,
-  "oof_r2": 0.7346572429237611,
-  "oof_rmse": 0.4635875848427831,
+  "best_score": 0.7884597020773999,
+  "train_rmse": 0.3596058101553165,
+  "train_r2": 0.7626634182264745,
+  "oof_r2": 0.7884597020773999,
+  "oof_rmse": 0.41392793215806983,
   "oof_n": 48,
   "best_score_type": "oof_r2",
   "use_target_mean": true,
   "target_mean_smoothing": 10.0,
   "data_signature": "d1fa20ba77a77fc4928b08cf2908c51f",
   "code_version": "2026-01-02_combined_clean_v1",
-  "tune_mode": "full",
-  "feature_set": "auto"
+  "tune_mode": "metrics",
+  "feature_set": "core"
 }

@@ -110,3 +110,18 @@ def drop_all_missing_features(
         logger.warning("Dropping %d all-missing features from %s: %s",
                        len(dropped), label, dropped)
     return good
+
+def add_rolling_features(panel: pd.DataFrame, windows=[3, 5]) -> pd.DataFrame:
+    panel = panel.sort_values(["region", "crop", "year"]).copy()
+    for w in windows:
+        # Rolling Mean of yield to capture recent productivity trends
+        panel[f"yield_rolling_mean_{w}"] = panel.groupby(["region", "crop"])["yield"].transform(
+            lambda x: x.shift(1).rolling(window=w, min_periods=1).mean()
+        )
+        # Rolling Std of precipitation to capture weather volatility
+        if "precipitation" in str(panel.columns).lower():
+            precip_col = [c for c in panel.columns if "precip" in c.lower()][0]
+            panel[f"precip_volatility_{w}"] = panel.groupby(["region", "crop"])[precip_col].transform(
+                lambda x: x.rolling(window=w, min_periods=1).std()
+            )
+    return panel
